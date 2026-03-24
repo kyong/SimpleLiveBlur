@@ -1,0 +1,4 @@
+opencv-python>=4.8.0
+mediapipe>=0.10.0
+PyQt6>=6.5.0
+pyinstaller>=6.0.0

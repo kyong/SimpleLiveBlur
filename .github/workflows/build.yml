@@ -1,0 +1,96 @@
+name: Build SimpleLiveBlur
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download models
+        run: |
+          curl -sL -o blaze_face_short_range.tflite \
+            https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite
+          curl -sL -o efficientdet_lite0.tflite \
+            https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite
+
+      - name: Build with PyInstaller
+        run: pyinstaller SimpleLiveBlur.spec
+
+      - name: Create ZIP
+        run: |
+          cd dist
+          zip -r ../SimpleLiveBlur-macOS.zip SimpleLiveBlur.app
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SimpleLiveBlur-macOS
+          path: SimpleLiveBlur-macOS.zip
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download models
+        run: |
+          curl -sL -o blaze_face_short_range.tflite https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite
+          curl -sL -o efficientdet_lite0.tflite https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite
+
+      - name: Build with PyInstaller
+        run: pyinstaller SimpleLiveBlur_win.spec
+
+      - name: Create ZIP
+        run: Compress-Archive -Path dist\SimpleLiveBlur -DestinationPath SimpleLiveBlur-Windows.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SimpleLiveBlur-Windows
+          path: SimpleLiveBlur-Windows.zip
+
+  release:
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: SimpleLiveBlur-macOS
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: SimpleLiveBlur-Windows
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            SimpleLiveBlur-macOS.zip
+            SimpleLiveBlur-Windows.zip
+          generate_release_notes: true

@@ -24,6 +24,7 @@ frame_lock = threading.Lock()
 # --- カメラ切り替え用 ---
 camera_index = 0
 camera_switch_event = threading.Event()
+stop_event = threading.Event()
 camera_status = ""
 status_lock = threading.Lock()
 
@@ -138,7 +139,7 @@ def capture_loop():
         with status_lock:
             camera_status = info
 
-        while True:
+        while not stop_event.is_set():
             if camera_switch_event.is_set():
                 cap.release()
                 cap = open_camera(camera_index)
@@ -208,6 +209,7 @@ def capture_loop():
                 latest_preview = output_rgb
 
         cap.release()
+        print("カメラを解放しました")
     except Exception as e:
         import traceback
         print(f"capture_loop エラー: {e}")
@@ -247,7 +249,7 @@ class MainWindow(QWidget):
     def __init__(self, cameras):
         super().__init__()
         self.cameras = cameras
-        self.setWindowTitle("Face Blur")
+        self.setWindowTitle("SimpleLiveBlur")
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -393,6 +395,13 @@ class MainWindow(QWidget):
         self.sl_obj_th_label.setText(f"{val:.2f}")
         self._set_config("object_threshold", val)
 
+    def closeEvent(self, event):
+        stop_event.set()
+        # キャプチャスレッドの終了を待つ
+        if hasattr(self, '_capture_thread') and self._capture_thread.is_alive():
+            self._capture_thread.join(timeout=3)
+        event.accept()
+
     def on_camera_change(self, idx):
         global camera_index
         if idx < 0:
@@ -448,5 +457,12 @@ if __name__ == '__main__':
     # PyQt6 GUI（メインスレッド）
     app = QApplication(sys.argv)
     window = MainWindow(cameras)
+    window._capture_thread = t_capture
     window.show()
-    sys.exit(app.exec())
+    ret = app.exec()
+
+    # GUI終了後のクリーンアップ
+    stop_event.set()
+    t_capture.join(timeout=3)
+    server.shutdown()
+    sys.exit(ret)
