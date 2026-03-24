@@ -15,9 +15,18 @@ OBSでリアルタイム顔ブラー配信を行うPythonスクリプト。
   └─ Python（face_blur_stream.py）
        ├─ MediaPipe Tasks API で顔検出
        ├─ OpenCV GaussianBlur でぼかし
+       ├─ PyQt6 GUI（プレビュー表示・カメラ切り替え）
        └─ MJPEGサーバー（localhost:8080）
              └─ OBS メディアソース → 配信
 ```
+
+### スレッド構成
+
+| スレッド           | 役割                                  |
+|--------------------|---------------------------------------|
+| メインスレッド      | PyQt6 GUI（イベントループ）            |
+| デーモンスレッド 1  | カメラキャプチャ + 顔検出 + ブラー処理 |
+| デーモンスレッド 2  | MJPEGサーバー（HTTP配信）              |
 
 ---
 
@@ -41,13 +50,14 @@ faceBlur/
 | Python | 3.x |
 | mediapipe | 0.10.33（Tasks API使用） |
 | opencv-python | 4.13.0.92 |
+| PyQt6 | 6.10.x（GUI） |
 
 ---
 
 ## 依存パッケージ
 
 ```bash
-pip install opencv-python mediapipe
+pip install opencv-python mediapipe PyQt6
 ```
 
 ※ `pyvirtualcam` はmacOS ARMに非対応のため不使用。  
@@ -73,7 +83,10 @@ curl -o blaze_face_short_range.tflite \
 python face_blur_stream.py
 ```
 
-起動後、OBSで以下を設定：
+起動するとGUIウィンドウが表示される。
+プレビューでブラー処理後の映像を確認でき、ドロップダウンでカメラを切り替え可能。
+
+OBSで以下を設定：
 
 ```
 ソース「+」→「メディアソース」
@@ -103,7 +116,7 @@ python face_blur_stream.py
 
 | 症状 | 対処 |
 |------|------|
-| カメラが映らない | `VideoCapture(0)` を `(1)` `(2)` に変更 |
+| カメラが映らない | GUIのドロップダウンで別のカメラに切り替え |
 | 顔を検出しない | `min_detection_confidence` を下げる / 照明を改善 |
 | 横顔・遠距離の顔を検出しない | モデルを `blaze_face_full_range.tflite` に変更（要別途ダウンロード） |
 | OBSで映像が出ない | スクリプト起動後にOBSのメディアソースを再接続 |
@@ -123,6 +136,8 @@ python face_blur_stream.py
 ## 今後の改善候補
 
 - [ ] 顔以外の個人特定情報（テキスト・ナンバープレート等）のマスク対応
+- [x] GUIでカメラ切り替え・プレビュー表示
 - [ ] GUIで閾値・ブラー強度をリアルタイム調整
+- [ ] PyInstallerによるインストーラー作成（Win/Mac対応）
 - [ ] 検出漏れ対策として複数フレームの検出結果をマージ
 - [ ] WebSocket経由での制御（開始・停止・パラメータ変更）
