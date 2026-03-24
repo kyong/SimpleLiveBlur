@@ -12,9 +12,10 @@ env/
 # Model files (large binary)
 *.tflite
 
-# IDE
+# IDE / Tools
 .vscode/
 .idea/
+.claude/
 
 # OS
 .DS_Store
