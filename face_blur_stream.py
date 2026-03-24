@@ -10,7 +10,8 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QComboBox, QCheckBox,
+    QLabel, QComboBox, QCheckBox, QSlider, QGroupBox,
+    QFormLayout,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QImage, QPixmap
@@ -32,6 +33,10 @@ blur_config = {
     "persons": False,
     "screens": False,
     "license_plates": False,
+    "blur_strength": 99,        # カーネルサイズ（奇数、1〜199）
+    "blur_sigma": 30,           # 標準偏差（1〜100）
+    "face_threshold": 0.5,      # 顔検出の閾値（0.0〜1.0）
+    "object_threshold": 0.4,    # 物体検出の閾値（0.0〜1.0）
 }
 blur_config_lock = threading.Lock()
 
@@ -57,24 +62,26 @@ def get_model_path(filename='blaze_face_short_range.tflite'):
     return os.path.join(base, filename)
 
 
-def blur_region(frame, x1, y1, x2, y2):
+def blur_region(frame, x1, y1, x2, y2, ksize=99, sigma=30):
     h, w = frame.shape[:2]
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w, x2), min(h, y2)
     roi = frame[y1:y2, x1:x2]
     if roi.size > 0:
-        frame[y1:y2, x1:x2] = cv2.GaussianBlur(roi, (99, 99), 30)
+        k = ksize if ksize % 2 == 1 else ksize + 1
+        frame[y1:y2, x1:x2] = cv2.GaussianBlur(roi, (k, k), sigma)
     return frame
 
 
-def blur_detection(frame, detection, padding=0.25):
+def blur_detection(frame, detection, padding=0.25, ksize=99, sigma=30):
     bb = detection.bounding_box
     px = int(bb.width * padding)
     py = int(bb.height * padding)
     return blur_region(frame,
                        bb.origin_x - px, bb.origin_y - py,
                        bb.origin_x + bb.width + px,
-                       bb.origin_y + bb.height + py)
+                       bb.origin_y + bb.height + py,
+                       ksize=ksize, sigma=sigma)
 
 
 def open_camera(index, retries=5):
@@ -157,21 +164,32 @@ def capture_loop():
             with blur_config_lock:
                 config = blur_config.copy()
 
+            ksize = config["blur_strength"]
+            sigma = config["blur_sigma"]
+            face_th = config["face_threshold"]
+            obj_th = config["object_threshold"]
+
             # 顔
             if config["faces"]:
                 result = face_detector.detect(mp_image)
                 for det in result.detections:
-                    output = blur_detection(output, det, padding=0.25)
+                    if det.categories[0].score >= face_th:
+                        output = blur_detection(output, det, padding=0.25,
+                                                ksize=ksize, sigma=sigma)
 
             # 人物・画面（共通の物体検出器）
             if config["persons"] or config["screens"]:
                 obj_result = object_detector.detect(mp_image)
                 for det in obj_result.detections:
-                    label = det.categories[0].category_name
-                    if label == "person" and config["persons"]:
-                        output = blur_detection(output, det, padding=0.05)
-                    elif label in ("tv", "laptop", "cell phone") and config["screens"]:
-                        output = blur_detection(output, det, padding=0.02)
+                    cat = det.categories[0]
+                    if cat.score < obj_th:
+                        continue
+                    if cat.category_name == "person" and config["persons"]:
+                        output = blur_detection(output, det, padding=0.05,
+                                                ksize=ksize, sigma=sigma)
+                    elif cat.category_name in ("tv", "laptop", "cell phone") and config["screens"]:
+                        output = blur_detection(output, det, padding=0.02,
+                                                ksize=ksize, sigma=sigma)
 
             # ナンバープレート
             if config["license_plates"]:
@@ -180,7 +198,8 @@ def capture_loop():
                     gray, 1.1, 4, minSize=(60, 20)
                 )
                 for (x, y, w, h) in plates:
-                    output = blur_region(output, x, y, x + w, y + h)
+                    output = blur_region(output, x, y, x + w, y + h,
+                                         ksize=ksize, sigma=sigma)
 
             _, jpeg = cv2.imencode('.jpg', output, [cv2.IMWRITE_JPEG_QUALITY, 85])
             output_rgb = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
@@ -265,6 +284,53 @@ class MainWindow(QWidget):
 
         layout.addLayout(toggle_layout)
 
+        # 詳細設定（折りたたみ）
+        self.detail_toggle = QCheckBox("詳細設定 ▶")
+        self.detail_toggle.setStyleSheet("padding: 4px 8px;")
+        self.detail_toggle.toggled.connect(self._toggle_details)
+        layout.addWidget(self.detail_toggle)
+
+        self.detail_widget = QWidget()
+        sliders = QFormLayout()
+        sliders.setContentsMargins(8, 0, 8, 4)
+        sliders.setHorizontalSpacing(12)
+
+        self.sl_strength = self._make_slider(1, 199, 99, 2)
+        self.sl_strength_label = QLabel("99")
+        self.sl_strength.valueChanged.connect(self._on_strength_changed)
+        strength_row = QHBoxLayout()
+        strength_row.addWidget(self.sl_strength)
+        strength_row.addWidget(self.sl_strength_label)
+        sliders.addRow("ブラー強度:", strength_row)
+
+        self.sl_sigma = self._make_slider(1, 100, 30, 1)
+        self.sl_sigma_label = QLabel("30")
+        self.sl_sigma.valueChanged.connect(self._on_sigma_changed)
+        sigma_row = QHBoxLayout()
+        sigma_row.addWidget(self.sl_sigma)
+        sigma_row.addWidget(self.sl_sigma_label)
+        sliders.addRow("ブラー拡散:", sigma_row)
+
+        self.sl_face_th = self._make_slider(1, 100, 50, 1)
+        self.sl_face_th_label = QLabel("0.50")
+        self.sl_face_th.valueChanged.connect(self._on_face_th_changed)
+        face_th_row = QHBoxLayout()
+        face_th_row.addWidget(self.sl_face_th)
+        face_th_row.addWidget(self.sl_face_th_label)
+        sliders.addRow("顔検出閾値:", face_th_row)
+
+        self.sl_obj_th = self._make_slider(1, 100, 40, 1)
+        self.sl_obj_th_label = QLabel("0.40")
+        self.sl_obj_th.valueChanged.connect(self._on_obj_th_changed)
+        obj_th_row = QHBoxLayout()
+        obj_th_row.addWidget(self.sl_obj_th)
+        obj_th_row.addWidget(self.sl_obj_th_label)
+        sliders.addRow("物体検出閾値:", obj_th_row)
+
+        self.detail_widget.setLayout(sliders)
+        self.detail_widget.setVisible(False)
+        layout.addWidget(self.detail_widget)
+
         # 下部コントロール
         ctrl = QHBoxLayout()
         ctrl.setContentsMargins(8, 0, 8, 6)
@@ -290,9 +356,42 @@ class MainWindow(QWidget):
         self.timer.timeout.connect(self.update_preview)
         self.timer.start(33)
 
+    @staticmethod
+    def _make_slider(min_val, max_val, default, step):
+        sl = QSlider(Qt.Orientation.Horizontal)
+        sl.setRange(min_val, max_val)
+        sl.setValue(default)
+        sl.setSingleStep(step)
+        sl.setFixedWidth(200)
+        return sl
+
+    def _toggle_details(self, checked):
+        self.detail_widget.setVisible(checked)
+        self.detail_toggle.setText("詳細設定 ▼" if checked else "詳細設定 ▶")
+        self.adjustSize()
+
     def _set_config(self, key, value):
         with blur_config_lock:
             blur_config[key] = value
+
+    def _on_strength_changed(self, v):
+        v = v if v % 2 == 1 else v + 1
+        self.sl_strength_label.setText(str(v))
+        self._set_config("blur_strength", v)
+
+    def _on_sigma_changed(self, v):
+        self.sl_sigma_label.setText(str(v))
+        self._set_config("blur_sigma", v)
+
+    def _on_face_th_changed(self, v):
+        val = v / 100.0
+        self.sl_face_th_label.setText(f"{val:.2f}")
+        self._set_config("face_threshold", val)
+
+    def _on_obj_th_changed(self, v):
+        val = v / 100.0
+        self.sl_obj_th_label.setText(f"{val:.2f}")
+        self._set_config("object_threshold", val)
 
     def on_camera_change(self, idx):
         global camera_index
