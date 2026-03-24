@@ -2,9 +2,10 @@
 
 ## プロジェクト概要
 
-OBSでリアルタイム顔ブラー配信を行うPythonスクリプト。
-カメラ映像を取得し、MediaPipeで顔検出 → GaussianBlurでぼかし → MJPEGストリームとして
-`http://localhost:8080/` に配信。OBSのメディアソースで受け取り配信する。
+OBSでリアルタイム個人情報ブラー配信を行うPythonアプリケーション。
+カメラ映像を取得し、顔・人物・画面・ナンバープレートを検出 → GaussianBlurでぼかし →
+MJPEGストリームとして `http://localhost:8080/` に配信。OBSのメディアソースで受け取り配信する。
+GUIからブラー対象のON/OFFをリアルタイムで切り替え可能。
 
 ---
 
@@ -13,7 +14,9 @@ OBSでリアルタイム顔ブラー配信を行うPythonスクリプト。
 ```
 物理カメラ
   └─ Python（face_blur_stream.py）
-       ├─ MediaPipe Tasks API で顔検出
+       ├─ MediaPipe FaceDetector で顔検出
+       ├─ MediaPipe ObjectDetector で人物・画面検出
+       ├─ OpenCV Haar Cascade でナンバープレート検出
        ├─ OpenCV GaussianBlur でぼかし
        ├─ PyQt6 GUI（プレビュー表示・カメラ切り替え）
        └─ MJPEGサーバー（localhost:8080）
@@ -25,7 +28,7 @@ OBSでリアルタイム顔ブラー配信を行うPythonスクリプト。
 | スレッド           | 役割                                  |
 |--------------------|---------------------------------------|
 | メインスレッド      | PyQt6 GUI（イベントループ）            |
-| デーモンスレッド 1  | カメラキャプチャ + 顔検出 + ブラー処理 |
+| デーモンスレッド 1  | カメラキャプチャ + PII検出 + ブラー処理 |
 | デーモンスレッド 2  | MJPEGサーバー（HTTP配信）              |
 
 ---
@@ -34,9 +37,10 @@ OBSでリアルタイム顔ブラー配信を行うPythonスクリプト。
 
 ```
 faceBlur/
-├── face_blur_stream.py          # メインスクリプト
-├── blaze_face_short_range.tflite  # MediaPipeモデルファイル（要ダウンロード）
-└── AGENTS.md                    # このファイル
+├── face_blur_stream.py            # メインスクリプト
+├── blaze_face_short_range.tflite  # 顔検出モデル（要ダウンロード）
+├── efficientdet_lite0.tflite      # 物体検出モデル（要ダウンロード）
+└── AGENTS.md                      # このファイル
 ```
 
 ---
@@ -68,11 +72,17 @@ pip install opencv-python mediapipe PyQt6
 ## モデルファイルのダウンロード
 
 ```bash
+# 顔検出モデル
 curl -o blaze_face_short_range.tflite \
   https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite
+
+# 物体検出モデル（人物・画面検出用）
+curl -o efficientdet_lite0.tflite \
+  https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite
 ```
 
 スクリプトと同じディレクトリに配置すること。
+ナンバープレート検出はOpenCV内蔵のHaar Cascadeを使用するため、追加ダウンロード不要。
 
 ---
 
@@ -101,14 +111,22 @@ OBSで以下を設定：
 
 | パラメータ | 場所 | デフォルト値 | 説明 |
 |-----------|------|-------------|------|
-| `padding` | `blur_faces()` | `0.25` | 顔領域の余白倍率。大きいほど広くぼかす |
+| `padding` | `blur_detection()` | `0.25` | 顔領域の余白倍率。大きいほど広くぼかす |
 | `(99, 99)` | `GaussianBlur` | — | ブラーカーネルサイズ。大きいほど強くぼかす |
 | `30` | `GaussianBlur` | — | ブラーの標準偏差。大きいほど強い |
-| `model_asset_path` | `BaseOptions` | `blaze_face_short_range.tflite` | モデルファイルパス |
 | `min_detection_confidence` | `FaceDetectorOptions` | `0.5` | 顔検出の閾値（0.0〜1.0） |
-| `cv2.VideoCapture(0)` | `capture_loop()` | `0` | カメラデバイス番号 |
+| `score_threshold` | `ObjectDetectorOptions` | `0.4` | 物体検出の閾値（0.0〜1.0） |
 | `IMWRITE_JPEG_QUALITY` | `imencode` | `85` | MJPEG品質（1〜100） |
 | `port` | `__main__` | `8080` | MJPEGサーバーのポート番号 |
+
+### ブラー対象（GUIチェックボックスで切り替え）
+
+| 対象 | 検出方法 | デフォルト |
+|------|---------|-----------|
+| 顔 | MediaPipe FaceDetector | ON |
+| 人物 | MediaPipe ObjectDetector（COCO "person"） | OFF |
+| 画面 | MediaPipe ObjectDetector（COCO "tv", "laptop", "cell phone"） | OFF |
+| ナンバープレート | OpenCV Haar Cascade | OFF |
 
 ---
 
@@ -120,7 +138,7 @@ OBSで以下を設定：
 | 顔を検出しない | `min_detection_confidence` を下げる / 照明を改善 |
 | 横顔・遠距離の顔を検出しない | モデルを `blaze_face_full_range.tflite` に変更（要別途ダウンロード） |
 | OBSで映像が出ない | スクリプト起動後にOBSのメディアソースを再接続 |
-| 処理が重い | `IMWRITE_JPEG_QUALITY` を下げる / 解像度を落とす |
+| 処理が重い | 不要なブラー対象をOFFにする / `IMWRITE_JPEG_QUALITY` を下げる / 解像度を落とす |
 | ポート競合エラー | `port = 8080` を別番号（例: `8081`）に変更 |
 
 ---
@@ -135,8 +153,9 @@ OBSで以下を設定：
 
 ## 今後の改善候補
 
-- [ ] 顔以外の個人特定情報（テキスト・ナンバープレート等）のマスク対応
+- [x] 顔以外の個人特定情報（人物・画面・ナンバープレート）のマスク対応
 - [x] GUIでカメラ切り替え・プレビュー表示
+- [x] GUIでブラー対象のON/OFF切り替え
 - [ ] GUIで閾値・ブラー強度をリアルタイム調整
 - [ ] PyInstallerによるインストーラー作成（Win/Mac対応）
 - [ ] 検出漏れ対策として複数フレームの検出結果をマージ

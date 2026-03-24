@@ -10,7 +10,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QComboBox,
+    QLabel, QComboBox, QCheckBox,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QImage, QPixmap
@@ -26,6 +26,15 @@ camera_switch_event = threading.Event()
 camera_status = ""
 status_lock = threading.Lock()
 
+# --- ブラー設定 ---
+blur_config = {
+    "faces": True,
+    "persons": False,
+    "screens": False,
+    "license_plates": False,
+}
+blur_config_lock = threading.Lock()
+
 
 def enumerate_cameras(max_index=5):
     available = []
@@ -40,23 +49,32 @@ def enumerate_cameras(max_index=5):
     return available
 
 
-def blur_faces(frame, detections, padding=0.25):
+def get_model_path(filename='blaze_face_short_range.tflite'):
+    if getattr(sys, 'frozen', False):
+        base = sys._MEIPASS
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, filename)
+
+
+def blur_region(frame, x1, y1, x2, y2):
     h, w = frame.shape[:2]
-    result = frame.copy()
-    if not detections:
-        return result
-    for det in detections:
-        bb = det.bounding_box
-        px = int(bb.width * padding)
-        py = int(bb.height * padding)
-        x1 = max(0, bb.origin_x - px)
-        y1 = max(0, bb.origin_y - py)
-        x2 = min(w, bb.origin_x + bb.width + px)
-        y2 = min(h, bb.origin_y + bb.height + py)
-        roi = result[y1:y2, x1:x2]
-        if roi.size > 0:
-            result[y1:y2, x1:x2] = cv2.GaussianBlur(roi, (99, 99), 30)
-    return result
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    roi = frame[y1:y2, x1:x2]
+    if roi.size > 0:
+        frame[y1:y2, x1:x2] = cv2.GaussianBlur(roi, (99, 99), 30)
+    return frame
+
+
+def blur_detection(frame, detection, padding=0.25):
+    bb = detection.bounding_box
+    px = int(bb.width * padding)
+    py = int(bb.height * padding)
+    return blur_region(frame,
+                       bb.origin_x - px, bb.origin_y - py,
+                       bb.origin_x + bb.width + px,
+                       bb.origin_y + bb.height + py)
 
 
 def open_camera(index, retries=5):
@@ -72,26 +90,36 @@ def open_camera(index, retries=5):
     return None
 
 
-def get_model_path():
-    if getattr(sys, 'frozen', False):
-        base = sys._MEIPASS
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, 'blaze_face_short_range.tflite')
-
-
 def capture_loop():
     global latest_frame, latest_preview, camera_status
 
     try:
-        base_options = mp_python.BaseOptions(
-            model_asset_path=get_model_path()
+        # 顔検出器
+        face_detector = mp_vision.FaceDetector.create_from_options(
+            mp_vision.FaceDetectorOptions(
+                base_options=mp_python.BaseOptions(
+                    model_asset_path=get_model_path('blaze_face_short_range.tflite')
+                ),
+                min_detection_confidence=0.5,
+            )
         )
-        options = mp_vision.FaceDetectorOptions(
-            base_options=base_options,
-            min_detection_confidence=0.5,
+
+        # 物体検出器（人物・画面）
+        object_detector = mp_vision.ObjectDetector.create_from_options(
+            mp_vision.ObjectDetectorOptions(
+                base_options=mp_python.BaseOptions(
+                    model_asset_path=get_model_path('efficientdet_lite0.tflite')
+                ),
+                max_results=10,
+                score_threshold=0.4,
+                category_allowlist=["person", "tv", "laptop", "cell phone"],
+            )
         )
-        detector = mp_vision.FaceDetector.create_from_options(options)
+
+        # ナンバープレート検出器
+        plate_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_russian_plate_number.xml'
+        )
 
         cap = open_camera(camera_index)
         if cap is None:
@@ -121,12 +149,40 @@ def capture_loop():
             ret, frame = cap.read()
             if not ret:
                 continue
+
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            result = detector.detect(mp_image)
-            output = blur_faces(frame, result.detections)
-            _, jpeg = cv2.imencode('.jpg', output, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            output = frame.copy()
 
+            with blur_config_lock:
+                config = blur_config.copy()
+
+            # 顔
+            if config["faces"]:
+                result = face_detector.detect(mp_image)
+                for det in result.detections:
+                    output = blur_detection(output, det, padding=0.25)
+
+            # 人物・画面（共通の物体検出器）
+            if config["persons"] or config["screens"]:
+                obj_result = object_detector.detect(mp_image)
+                for det in obj_result.detections:
+                    label = det.categories[0].category_name
+                    if label == "person" and config["persons"]:
+                        output = blur_detection(output, det, padding=0.05)
+                    elif label in ("tv", "laptop", "cell phone") and config["screens"]:
+                        output = blur_detection(output, det, padding=0.02)
+
+            # ナンバープレート
+            if config["license_plates"]:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                plates = plate_cascade.detectMultiScale(
+                    gray, 1.1, 4, minSize=(60, 20)
+                )
+                for (x, y, w, h) in plates:
+                    output = blur_region(output, x, y, x + w, y + h)
+
+            _, jpeg = cv2.imencode('.jpg', output, [cv2.IMWRITE_JPEG_QUALITY, 85])
             output_rgb = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
             with frame_lock:
                 latest_frame = jpeg.tobytes()
@@ -185,9 +241,33 @@ class MainWindow(QWidget):
         self.preview_label.setMinimumSize(PREVIEW_WIDTH, 270)
         layout.addWidget(self.preview_label)
 
+        # ブラー対象トグル
+        toggle_layout = QHBoxLayout()
+        toggle_layout.setContentsMargins(8, 6, 8, 6)
+
+        self.cb_faces = QCheckBox("顔")
+        self.cb_faces.setChecked(True)
+        self.cb_faces.toggled.connect(lambda v: self._set_config("faces", v))
+
+        self.cb_persons = QCheckBox("人物")
+        self.cb_persons.toggled.connect(lambda v: self._set_config("persons", v))
+
+        self.cb_screens = QCheckBox("画面")
+        self.cb_screens.toggled.connect(lambda v: self._set_config("screens", v))
+
+        self.cb_plates = QCheckBox("ナンバー")
+        self.cb_plates.toggled.connect(lambda v: self._set_config("license_plates", v))
+
+        for cb in (self.cb_faces, self.cb_persons, self.cb_screens, self.cb_plates):
+            toggle_layout.addWidget(cb)
+        toggle_layout.setSpacing(16)
+        toggle_layout.addStretch()
+
+        layout.addLayout(toggle_layout)
+
         # 下部コントロール
         ctrl = QHBoxLayout()
-        ctrl.setContentsMargins(8, 6, 8, 6)
+        ctrl.setContentsMargins(8, 0, 8, 6)
 
         ctrl.addWidget(QLabel("カメラ:"))
         self.combo = QComboBox()
@@ -209,6 +289,10 @@ class MainWindow(QWidget):
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_preview)
         self.timer.start(33)
+
+    def _set_config(self, key, value):
+        with blur_config_lock:
+            blur_config[key] = value
 
     def on_camera_change(self, idx):
         global camera_index
