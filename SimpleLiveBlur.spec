@@ -1,9 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
 import cv2
+import mediapipe
 
 # OpenCV の Haar Cascade パスを取得
 haarcascades_dir = os.path.join(os.path.dirname(cv2.__file__), 'data')
+
+# mediapipe の tasks/c ディレクトリ（libmediapipe.dylib を含む）
+mediapipe_dir = os.path.dirname(mediapipe.__file__)
+mediapipe_tasks_c_dir = os.path.join(mediapipe_dir, 'tasks', 'c')
 
 a = Analysis(
     ['face_blur_stream.py'],
@@ -14,10 +19,12 @@ a = Analysis(
         ('efficientdet_lite0.tflite', '.'),
         (os.path.join(haarcascades_dir, 'haarcascade_russian_plate_number.xml'),
          os.path.join('cv2', 'data')),
+        (mediapipe_tasks_c_dir, os.path.join('mediapipe', 'tasks', 'c')),
     ],
     hiddenimports=[
         'mediapipe',
         'mediapipe.tasks',
+        'mediapipe.tasks.c',
         'mediapipe.tasks.python',
         'mediapipe.tasks.python.vision',
     ],
@@ -64,4 +71,6 @@ app = BUNDLE(
         'NSCameraUsageDescription': 'SimpleLiveBlur needs camera access for real-time face blurring.',
         'CFBundleShortVersionString': '1.0.0',
     },
+    codesign_identity='-',
+    entitlements_file='entitlements.plist',
 )

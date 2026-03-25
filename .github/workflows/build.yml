@@ -32,10 +32,13 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller SimpleLiveBlur.spec
 
+      - name: Sign with entitlements
+        run: codesign --force --deep --sign - --entitlements entitlements.plist dist/SimpleLiveBlur.app
+
       - name: Create ZIP
         run: |
           cd dist
-          zip -r ../SimpleLiveBlur-macOS.zip SimpleLiveBlur.app
+          ditto -c -k --keepParent SimpleLiveBlur.app ../SimpleLiveBlur-macOS.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

@@ -19,6 +19,30 @@
 | macOS | `SimpleLiveBlur-macOS.zip` |
 | Windows | `SimpleLiveBlur-Windows.zip` |
 
+### macOS での初回起動
+
+署名されていないアプリのため、初回はGatekeeperにブロックされます。以下のいずれかの方法で開いてください。
+
+**方法1：右クリックで開く**
+
+アプリを右クリック（またはControl+クリック）→「開く」→ 確認ダイアログで「開く」をクリック
+
+**方法2：ターミナルで属性を解除**
+
+ZIPを展開したフォルダで以下を実行してください。
+
+```bash
+xattr -cr SimpleLiveBlur.app
+```
+
+※ 必要に応じて `SimpleLiveBlur.app` を `/Applications` にドラッグしてインストールできます。一度開けば、以降は通常通りダブルクリックで起動できます。
+
+### Windows での初回起動
+
+署名されていないアプリのため、SmartScreenの警告が表示されます。
+
+「詳細情報」をクリック →「実行」をクリックで起動できます。
+
 ## ソースからのセットアップ
 
 ### 必要なもの

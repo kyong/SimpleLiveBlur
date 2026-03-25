@@ -42,10 +42,16 @@ blur_config = {
 blur_config_lock = threading.Lock()
 
 
+def _video_capture(index):
+    if sys.platform == 'darwin':
+        return cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+    return cv2.VideoCapture(index)
+
+
 def enumerate_cameras(max_index=5):
     available = []
     for i in range(max_index):
-        cap = cv2.VideoCapture(i)
+        cap = _video_capture(i)
         if cap.isOpened():
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -87,7 +93,7 @@ def blur_detection(frame, detection, padding=0.25, ksize=99, sigma=30):
 
 def open_camera(index, retries=5):
     for attempt in range(retries):
-        cap = cv2.VideoCapture(index)
+        cap = _video_capture(index)
         if cap.isOpened():
             for _ in range(3):
                 cap.read()
