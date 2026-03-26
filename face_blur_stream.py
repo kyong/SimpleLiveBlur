@@ -6,6 +6,7 @@ import threading
 import time
 import sys
 import os
+from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from PyQt6.QtWidgets import (
@@ -38,6 +39,7 @@ blur_config = {
     "blur_sigma": 30,           # 標準偏差（1〜100）
     "face_threshold": 0.5,      # 顔検出の閾値（0.0〜1.0）
     "object_threshold": 0.4,    # 物体検出の閾値（0.0〜1.0）
+    "history_frames": 5,        # 検出マージフレーム数（0=OFF）
 }
 blur_config_lock = threading.Lock()
 
@@ -145,6 +147,9 @@ def capture_loop():
         with status_lock:
             camera_status = info
 
+        # 検出矩形の履歴（直近フレーム分を保持して検出漏れを補完）
+        rect_history = deque(maxlen=5)
+
         while not stop_event.is_set():
             if camera_switch_event.is_set():
                 cap.release()
@@ -159,6 +164,7 @@ def capture_loop():
                 with status_lock:
                     camera_status = info
                 camera_switch_event.clear()
+                rect_history.clear()
 
             ret, frame = cap.read()
             if not ret:
@@ -176,13 +182,22 @@ def capture_loop():
             face_th = config["face_threshold"]
             obj_th = config["object_threshold"]
 
+            # 現フレームの検出矩形を収集
+            current_rects = []
+
             # 顔
             if config["faces"]:
                 result = face_detector.detect(mp_image)
                 for det in result.detections:
                     if det.categories[0].score >= face_th:
-                        output = blur_detection(output, det, padding=0.25,
-                                                ksize=ksize, sigma=sigma)
+                        bb = det.bounding_box
+                        pad = 0.25
+                        px, py = int(bb.width * pad), int(bb.height * pad)
+                        current_rects.append((
+                            bb.origin_x - px, bb.origin_y - py,
+                            bb.origin_x + bb.width + px,
+                            bb.origin_y + bb.height + py,
+                        ))
 
             # 人物・画面（共通の物体検出器）
             if config["persons"] or config["screens"]:
@@ -191,12 +206,23 @@ def capture_loop():
                     cat = det.categories[0]
                     if cat.score < obj_th:
                         continue
+                    bb = det.bounding_box
                     if cat.category_name == "person" and config["persons"]:
-                        output = blur_detection(output, det, padding=0.05,
-                                                ksize=ksize, sigma=sigma)
+                        pad = 0.05
+                        px, py = int(bb.width * pad), int(bb.height * pad)
+                        current_rects.append((
+                            bb.origin_x - px, bb.origin_y - py,
+                            bb.origin_x + bb.width + px,
+                            bb.origin_y + bb.height + py,
+                        ))
                     elif cat.category_name in ("tv", "laptop", "cell phone") and config["screens"]:
-                        output = blur_detection(output, det, padding=0.02,
-                                                ksize=ksize, sigma=sigma)
+                        pad = 0.02
+                        px, py = int(bb.width * pad), int(bb.height * pad)
+                        current_rects.append((
+                            bb.origin_x - px, bb.origin_y - py,
+                            bb.origin_x + bb.width + px,
+                            bb.origin_y + bb.height + py,
+                        ))
 
             # ナンバープレート
             if config["license_plates"]:
@@ -205,7 +231,25 @@ def capture_loop():
                     gray, 1.1, 4, minSize=(60, 20)
                 )
                 for (x, y, w, h) in plates:
-                    output = blur_region(output, x, y, x + w, y + h,
+                    current_rects.append((x, y, x + w, y + h))
+
+            # 履歴フレーム数を設定から反映
+            history_frames = config["history_frames"]
+            if history_frames != rect_history.maxlen:
+                rect_history = deque(rect_history, maxlen=max(1, history_frames))
+
+            # 履歴に追加
+            rect_history.append(current_rects)
+
+            # 現フレーム＋過去フレームの全矩形をマージしてブラー
+            if history_frames > 0:
+                for rects in rect_history:
+                    for (x1, y1, x2, y2) in rects:
+                        output = blur_region(output, x1, y1, x2, y2,
+                                             ksize=ksize, sigma=sigma)
+            else:
+                for (x1, y1, x2, y2) in current_rects:
+                    output = blur_region(output, x1, y1, x2, y2,
                                          ksize=ksize, sigma=sigma)
 
             _, jpeg = cv2.imencode('.jpg', output, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -335,6 +379,14 @@ class MainWindow(QWidget):
         obj_th_row.addWidget(self.sl_obj_th_label)
         sliders.addRow("物体検出閾値:", obj_th_row)
 
+        self.sl_history = self._make_slider(0, 15, 5, 1)
+        self.sl_history_label = QLabel("5")
+        self.sl_history.valueChanged.connect(self._on_history_changed)
+        history_row = QHBoxLayout()
+        history_row.addWidget(self.sl_history)
+        history_row.addWidget(self.sl_history_label)
+        sliders.addRow("検出マージ:", history_row)
+
         self.detail_widget.setLayout(sliders)
         self.detail_widget.setVisible(False)
         layout.addWidget(self.detail_widget)
@@ -420,6 +472,10 @@ class MainWindow(QWidget):
         val = v / 100.0
         self.sl_obj_th_label.setText(f"{val:.2f}")
         self._set_config("object_threshold", val)
+
+    def _on_history_changed(self, v):
+        self.sl_history_label.setText(str(v) if v > 0 else "OFF")
+        self._set_config("history_frames", v)
 
     def closeEvent(self, event):
         stop_event.set()
