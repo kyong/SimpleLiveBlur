@@ -339,6 +339,19 @@ class MainWindow(QWidget):
         self.detail_widget.setVisible(False)
         layout.addWidget(self.detail_widget)
 
+        # OBS接続ヘルプ
+        self.help_widget = QLabel()
+        self.help_widget.setTextFormat(Qt.TextFormat.RichText)
+        self.help_widget.setWordWrap(True)
+        self.help_widget.setStyleSheet(
+            "background-color: #2a2a3a; color: #ccc; font-size: 11px;"
+            "padding: 6px 10px; border-radius: 4px; margin: 4px 8px;"
+        )
+        self.help_widget.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(self.help_widget)
+
         # 下部コントロール
         ctrl = QHBoxLayout()
         ctrl.setContentsMargins(8, 0, 8, 6)
@@ -372,6 +385,13 @@ class MainWindow(QWidget):
         sl.setSingleStep(step)
         sl.setFixedWidth(200)
         return sl
+
+    def set_port(self, port):
+        self.help_widget.setText(
+            f'📡 配信URL: <b>http://localhost:{port}/</b><br>'
+            '　OBS → ソース追加 → <b>メディアソース</b> → '
+            '「ローカルファイル」OFF → 上記URLを入力'
+        )
 
     def _toggle_details(self, checked):
         self.detail_widget.setVisible(checked)
@@ -453,9 +473,18 @@ if __name__ == '__main__':
     t_capture = threading.Thread(target=capture_loop, daemon=True)
     t_capture.start()
 
-    # MJPEGサーバースレッド
+    # MJPEGサーバースレッド（ポート競合時は自動で空きポートへ）
     port = 8080
-    server = HTTPServer(('localhost', port), MJPEGHandler)
+    for p in [port] + list(range(8081, 8100)):
+        try:
+            server = HTTPServer(('localhost', p), MJPEGHandler)
+            port = p
+            break
+        except OSError:
+            continue
+    else:
+        print("エラー: 空きポートが見つかりません (8080-8099)")
+        sys.exit(1)
     t_server = threading.Thread(target=server.serve_forever, daemon=True)
     t_server.start()
     print(f"ストリーム配信中: http://localhost:{port}/")
@@ -463,6 +492,7 @@ if __name__ == '__main__':
     # PyQt6 GUI（メインスレッド）
     app = QApplication(sys.argv)
     window = MainWindow(cameras)
+    window.set_port(port)
     window._capture_thread = t_capture
     window.show()
     ret = app.exec()
