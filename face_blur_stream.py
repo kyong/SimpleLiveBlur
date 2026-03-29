@@ -3,18 +3,26 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 import threading
+import asyncio
+import json
 import time
 import sys
 import os
 from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+try:
+    import websockets
+    HAS_WEBSOCKETS = True
+except ImportError:
+    HAS_WEBSOCKETS = False
+
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QCheckBox, QSlider, QGroupBox,
     QFormLayout,
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 
 # --- 共有フレームバッファ ---
@@ -291,15 +299,159 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             pass
 
 
+# --- WebSocket制御サーバー ---
+# 設定キーの型・範囲定義
+_CONFIG_SCHEMA = {
+    "faces": bool,
+    "persons": bool,
+    "screens": bool,
+    "license_plates": bool,
+    "blur_strength": (int, 1, 199),
+    "blur_sigma": (int, 1, 100),
+    "face_threshold": (float, 0.01, 1.0),
+    "object_threshold": (float, 0.01, 1.0),
+    "history_frames": (int, 0, 15),
+}
+
+# GUIとWebSocket間の同期用シグナル
+ws_config_update = None  # MainWindow設定後にセットされる
+
+
+def _validate_config_value(key, value):
+    """設定値をバリデーションし、正規化した値を返す。不正な場合はNone。"""
+    schema = _CONFIG_SCHEMA.get(key)
+    if schema is None:
+        return None
+    if schema is bool:
+        if isinstance(value, bool):
+            return value
+        return None
+    typ, lo, hi = schema
+    try:
+        v = typ(value)
+    except (ValueError, TypeError):
+        return None
+    return max(lo, min(hi, v))
+
+
+def _get_config_snapshot():
+    with blur_config_lock:
+        return blur_config.copy()
+
+
+async def _ws_handler(websocket):
+    """
+    WebSocketメッセージ形式（JSON）:
+      {"action": "get_config"}
+      {"action": "set_config", "key": "faces", "value": true}
+      {"action": "set_config", "config": {"faces": true, "blur_strength": 50}}
+      {"action": "get_status"}
+    """
+    async for raw in websocket:
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            await websocket.send(json.dumps(
+                {"error": "invalid JSON"}, ensure_ascii=False))
+            continue
+
+        action = msg.get("action")
+
+        if action == "get_config":
+            await websocket.send(json.dumps(
+                {"config": _get_config_snapshot()}, ensure_ascii=False))
+
+        elif action == "set_config":
+            # 単一キー
+            if "key" in msg and "value" in msg:
+                pairs = {msg["key"]: msg["value"]}
+            # 一括
+            elif "config" in msg and isinstance(msg["config"], dict):
+                pairs = msg["config"]
+            else:
+                await websocket.send(json.dumps(
+                    {"error": "set_config requires 'key'+'value' or 'config'"},
+                    ensure_ascii=False))
+                continue
+
+            applied = {}
+            errors = {}
+            for k, v in pairs.items():
+                validated = _validate_config_value(k, v)
+                if validated is None:
+                    errors[k] = f"invalid value: {v!r}"
+                else:
+                    with blur_config_lock:
+                        blur_config[k] = validated
+                    applied[k] = validated
+
+            # GUIに同期通知
+            if applied and ws_config_update is not None:
+                ws_config_update.emit()
+
+            resp = {"applied": applied}
+            if errors:
+                resp["errors"] = errors
+            await websocket.send(json.dumps(resp, ensure_ascii=False))
+
+        elif action == "get_status":
+            with status_lock:
+                s = camera_status
+            await websocket.send(json.dumps(
+                {"status": s, "running": not stop_event.is_set()},
+                ensure_ascii=False))
+
+        else:
+            await websocket.send(json.dumps(
+                {"error": f"unknown action: {action}"}, ensure_ascii=False))
+
+
+def start_ws_server(port):
+    """WebSocketサーバーを別スレッドで起動。ポート競合時は自動で空きポートへ。"""
+    async def _run(p):
+        async with websockets.serve(_ws_handler, "localhost", p):
+            await asyncio.Future()  # run forever
+
+    actual_port = port
+    loop = asyncio.new_event_loop()
+
+    for p in [port] + list(range(port + 1, port + 20)):
+        try:
+            # ポートが使えるかテスト
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("localhost", p))
+            s.close()
+            actual_port = p
+            break
+        except OSError:
+            continue
+    else:
+        print(f"警告: WebSocketサーバー用の空きポートが見つかりません ({port}-{port+19})")
+        return None
+
+    def _thread_target():
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_run(actual_port))
+
+    t = threading.Thread(target=_thread_target, daemon=True)
+    t.start()
+    print(f"WebSocket制御: ws://localhost:{actual_port}/")
+    return actual_port
+
+
 # --- PyQt6 GUI ---
 PREVIEW_WIDTH = 480
 
 
 class MainWindow(QWidget):
+    config_changed_externally = pyqtSignal()
+
     def __init__(self, cameras):
         super().__init__()
         self.cameras = cameras
         self.setWindowTitle("SimpleLiveBlur")
+        self.config_changed_externally.connect(self._sync_gui_from_config)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -438,12 +590,15 @@ class MainWindow(QWidget):
         sl.setFixedWidth(200)
         return sl
 
-    def set_port(self, port):
-        self.help_widget.setText(
-            f'📡 配信URL: <b>http://localhost:{port}/</b><br>'
+    def set_port(self, port, ws_port=None):
+        lines = [f'📡 配信URL: <b>http://localhost:{port}/</b>']
+        if ws_port is not None:
+            lines.append(f'🔌 WebSocket: <b>ws://localhost:{ws_port}/</b>')
+        lines.append(
             '　OBS → ソース追加 → <b>メディアソース</b> → '
-            '「ローカルファイル」OFF → 上記URLを入力'
+            '「ローカルファイル」OFF → 配信URLを入力'
         )
+        self.help_widget.setText('<br>'.join(lines))
 
     def _toggle_details(self, checked):
         self.detail_widget.setVisible(checked)
@@ -476,6 +631,53 @@ class MainWindow(QWidget):
     def _on_history_changed(self, v):
         self.sl_history_label.setText(str(v) if v > 0 else "OFF")
         self._set_config("history_frames", v)
+
+    def _sync_gui_from_config(self):
+        """WebSocketから設定が変更されたとき、GUIを同期する。"""
+        with blur_config_lock:
+            config = blur_config.copy()
+        # blockSignals で再帰的な _set_config 呼び出しを防ぐ
+        self.cb_faces.blockSignals(True)
+        self.cb_faces.setChecked(config["faces"])
+        self.cb_faces.blockSignals(False)
+
+        self.cb_persons.blockSignals(True)
+        self.cb_persons.setChecked(config["persons"])
+        self.cb_persons.blockSignals(False)
+
+        self.cb_screens.blockSignals(True)
+        self.cb_screens.setChecked(config["screens"])
+        self.cb_screens.blockSignals(False)
+
+        self.cb_plates.blockSignals(True)
+        self.cb_plates.setChecked(config["license_plates"])
+        self.cb_plates.blockSignals(False)
+
+        self.sl_strength.blockSignals(True)
+        self.sl_strength.setValue(config["blur_strength"])
+        self.sl_strength_label.setText(str(config["blur_strength"]))
+        self.sl_strength.blockSignals(False)
+
+        self.sl_sigma.blockSignals(True)
+        self.sl_sigma.setValue(config["blur_sigma"])
+        self.sl_sigma_label.setText(str(config["blur_sigma"]))
+        self.sl_sigma.blockSignals(False)
+
+        self.sl_face_th.blockSignals(True)
+        self.sl_face_th.setValue(int(config["face_threshold"] * 100))
+        self.sl_face_th_label.setText(f"{config['face_threshold']:.2f}")
+        self.sl_face_th.blockSignals(False)
+
+        self.sl_obj_th.blockSignals(True)
+        self.sl_obj_th.setValue(int(config["object_threshold"] * 100))
+        self.sl_obj_th_label.setText(f"{config['object_threshold']:.2f}")
+        self.sl_obj_th.blockSignals(False)
+
+        self.sl_history.blockSignals(True)
+        self.sl_history.setValue(config["history_frames"])
+        hf = config["history_frames"]
+        self.sl_history_label.setText(str(hf) if hf > 0 else "OFF")
+        self.sl_history.blockSignals(False)
 
     def closeEvent(self, event):
         stop_event.set()
@@ -545,11 +747,22 @@ if __name__ == '__main__':
     t_server.start()
     print(f"ストリーム配信中: http://localhost:{port}/")
 
+    # WebSocket制御サーバー
+    ws_port = None
+    if HAS_WEBSOCKETS:
+        ws_port = start_ws_server(port + 1)
+    else:
+        print("警告: websocketsがインストールされていないため、WebSocket制御は無効です")
+
     # PyQt6 GUI（メインスレッド）
     app = QApplication(sys.argv)
     window = MainWindow(cameras)
-    window.set_port(port)
+    window.set_port(port, ws_port)
     window._capture_thread = t_capture
+
+    # WebSocket→GUI同期シグナルを接続
+    ws_config_update = window.config_changed_externally
+
     window.show()
     ret = app.exec()
 
