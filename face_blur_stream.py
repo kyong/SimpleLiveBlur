@@ -20,7 +20,7 @@ except ImportError:
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QCheckBox, QSlider, QGroupBox,
-    QFormLayout,
+    QFormLayout, QPushButton,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
@@ -586,6 +586,12 @@ class MainWindow(QWidget):
         self.combo.currentIndexChanged.connect(self.on_camera_change)
         ctrl.addWidget(self.combo)
 
+        self.refresh_btn = QPushButton("🔄")
+        self.refresh_btn.setFixedWidth(32)
+        self.refresh_btn.setToolTip("カメラを再検出")
+        self.refresh_btn.clicked.connect(self._refresh_cameras)
+        ctrl.addWidget(self.refresh_btn)
+
         ctrl.addStretch()
 
         self.status_label = QLabel("起動中...")
@@ -715,6 +721,36 @@ class MainWindow(QWidget):
         camera_index = new_index
         camera_switch_event.set()
         self.status_label.setText(f"カメラ {new_index} に切り替え中...")
+
+    def _refresh_cameras(self):
+        self.refresh_btn.setEnabled(False)
+        self.status_label.setText("カメラを再検出中...")
+
+        def _scan():
+            return enumerate_cameras()
+
+        def _done(new_cameras):
+            current_idx = camera_index
+            self.cameras = new_cameras
+            self.combo.blockSignals(True)
+            self.combo.clear()
+            selected = 0
+            for i, (cam_id, label) in enumerate(new_cameras):
+                self.combo.addItem(label)
+                if cam_id == current_idx:
+                    selected = i
+            self.combo.setCurrentIndex(selected)
+            self.combo.blockSignals(False)
+            self.refresh_btn.setEnabled(True)
+            self.status_label.setText(
+                f"{len(new_cameras)} 台検出" if new_cameras else "カメラなし"
+            )
+
+        def _thread():
+            result = _scan()
+            QTimer.singleShot(0, lambda: _done(result))
+
+        threading.Thread(target=_thread, daemon=True).start()
 
     def update_preview(self):
         with frame_lock:
