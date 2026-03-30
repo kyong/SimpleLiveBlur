@@ -282,19 +282,28 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path != '/':
+            self.send_error(404)
+            return
         self.send_response(200)
         self.send_header('Content-Type',
                          'multipart/x-mixed-replace; boundary=frame')
+        self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
+        prev_frame = None
         try:
-            while True:
+            while not stop_event.is_set():
                 with frame_lock:
                     frame = latest_frame
-                if frame:
+                if frame is not None and frame is not prev_frame:
                     self.wfile.write(b'--frame\r\n')
                     self.wfile.write(b'Content-Type: image/jpeg\r\n\r\n')
                     self.wfile.write(frame)
                     self.wfile.write(b'\r\n')
+                    self.wfile.flush()
+                    prev_frame = frame
+                else:
+                    time.sleep(0.01)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
