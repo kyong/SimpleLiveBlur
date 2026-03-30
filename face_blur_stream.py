@@ -48,6 +48,7 @@ blur_config = {
     "face_threshold": 0.5,      # 顔検出の閾値（0.0〜1.0）
     "object_threshold": 0.4,    # 物体検出の閾値（0.0〜1.0）
     "history_frames": 5,        # 検出マージフレーム数（0=OFF）
+    "lite_mode": False,         # 軽量モード
 }
 blur_config_lock = threading.Lock()
 
@@ -158,7 +159,6 @@ def capture_loop():
         # 検出矩形の履歴（直近フレーム分を保持して検出漏れを補完）
         rect_history = deque(maxlen=5)
         frame_count = 0
-        DETECT_INTERVAL = 3  # N フレームに1回だけML検出を実行
         cached_rects = []    # 検出しないフレームで使う矩形キャッシュ
 
         while not stop_event.is_set():
@@ -186,15 +186,26 @@ def capture_loop():
             with blur_config_lock:
                 config = blur_config.copy()
 
+            lite = config["lite_mode"]
             ksize = config["blur_strength"]
             sigma = config["blur_sigma"]
 
-            # N フレームに1回だけ検出を実行（重いML推論をスキップ）
-            run_detect = (frame_count % DETECT_INTERVAL == 0)
+            # 軽量モード: 検出間隔を広げ、フレームを縮小して推論
+            detect_interval = 6 if lite else 3
+            run_detect = (frame_count % detect_interval == 0)
             frame_count += 1
 
             if run_detect:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # 軽量モード: 検出用に縮小（座標は元サイズに戻す）
+                if lite:
+                    orig_h, orig_w = frame.shape[:2]
+                    det_frame = cv2.resize(frame, (orig_w // 2, orig_h // 2))
+                    scale = 2.0
+                else:
+                    det_frame = frame
+                    scale = 1.0
+
+                rgb = cv2.cvtColor(det_frame, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
                 face_th = config["face_threshold"]
@@ -210,9 +221,10 @@ def capture_loop():
                             pad = 0.25
                             px, py = int(bb.width * pad), int(bb.height * pad)
                             current_rects.append((
-                                bb.origin_x - px, bb.origin_y - py,
-                                bb.origin_x + bb.width + px,
-                                bb.origin_y + bb.height + py,
+                                int((bb.origin_x - px) * scale),
+                                int((bb.origin_y - py) * scale),
+                                int((bb.origin_x + bb.width + px) * scale),
+                                int((bb.origin_y + bb.height + py) * scale),
                             ))
 
                 # 人物・画面（共通の物体検出器）
@@ -225,29 +237,29 @@ def capture_loop():
                         bb = det.bounding_box
                         if cat.category_name == "person" and config["persons"]:
                             pad = 0.05
-                            px, py = int(bb.width * pad), int(bb.height * pad)
-                            current_rects.append((
-                                bb.origin_x - px, bb.origin_y - py,
-                                bb.origin_x + bb.width + px,
-                                bb.origin_y + bb.height + py,
-                            ))
                         elif cat.category_name in ("tv", "laptop", "cell phone") and config["screens"]:
                             pad = 0.02
-                            px, py = int(bb.width * pad), int(bb.height * pad)
-                            current_rects.append((
-                                bb.origin_x - px, bb.origin_y - py,
-                                bb.origin_x + bb.width + px,
-                                bb.origin_y + bb.height + py,
-                            ))
+                        else:
+                            continue
+                        px, py = int(bb.width * pad), int(bb.height * pad)
+                        current_rects.append((
+                            int((bb.origin_x - px) * scale),
+                            int((bb.origin_y - py) * scale),
+                            int((bb.origin_x + bb.width + px) * scale),
+                            int((bb.origin_y + bb.height + py) * scale),
+                        ))
 
                 # ナンバープレート
                 if config["license_plates"]:
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    gray = cv2.cvtColor(det_frame, cv2.COLOR_BGR2GRAY)
                     plates = plate_cascade.detectMultiScale(
                         gray, 1.1, 4, minSize=(60, 20)
                     )
                     for (x, y, w, h) in plates:
-                        current_rects.append((x, y, x + w, y + h))
+                        current_rects.append((
+                            int(x * scale), int(y * scale),
+                            int((x + w) * scale), int((y + h) * scale),
+                        ))
 
                 cached_rects = current_rects
 
@@ -270,11 +282,16 @@ def capture_loop():
                     output = blur_region(output, x1, y1, x2, y2,
                                          ksize=ksize, sigma=sigma)
 
-            _, jpeg = cv2.imencode('.jpg', output, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            jpeg_quality = 60 if lite else 80
+            _, jpeg = cv2.imencode('.jpg', output, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
             output_rgb = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
             with frame_lock:
                 latest_frame = jpeg.tobytes()
                 latest_preview = output_rgb
+
+            # 軽量モード: FPS制限（~15fps）
+            if lite:
+                time.sleep(0.03)
 
         cap.release()
         print("カメラを解放しました")
@@ -330,6 +347,7 @@ _CONFIG_SCHEMA = {
     "face_threshold": (float, 0.01, 1.0),
     "object_threshold": (float, 0.01, 1.0),
     "history_frames": (int, 0, 15),
+    "lite_mode": bool,
 }
 
 # GUIとWebSocket間の同期用シグナル
@@ -504,6 +522,11 @@ class MainWindow(QWidget):
             toggle_layout.addWidget(cb)
         toggle_layout.setSpacing(16)
         toggle_layout.addStretch()
+
+        self.cb_lite = QCheckBox("軽量")
+        self.cb_lite.setToolTip("CPU負荷を大幅に削減（検出精度は低下）")
+        self.cb_lite.toggled.connect(lambda v: self._set_config("lite_mode", v))
+        toggle_layout.addWidget(self.cb_lite)
 
         layout.addLayout(toggle_layout)
 
@@ -703,6 +726,10 @@ class MainWindow(QWidget):
         hf = config["history_frames"]
         self.sl_history_label.setText(str(hf) if hf > 0 else "OFF")
         self.sl_history.blockSignals(False)
+
+        self.cb_lite.blockSignals(True)
+        self.cb_lite.setChecked(config["lite_mode"])
+        self.cb_lite.blockSignals(False)
 
     def closeEvent(self, event):
         stop_event.set()
