@@ -157,6 +157,9 @@ def capture_loop():
 
         # 検出矩形の履歴（直近フレーム分を保持して検出漏れを補完）
         rect_history = deque(maxlen=5)
+        frame_count = 0
+        DETECT_INTERVAL = 3  # N フレームに1回だけML検出を実行
+        cached_rects = []    # 検出しないフレームで使う矩形キャッシュ
 
         while not stop_event.is_set():
             if camera_switch_event.is_set():
@@ -173,94 +176,101 @@ def capture_loop():
                     camera_status = info
                 camera_switch_event.clear()
                 rect_history.clear()
+                cached_rects = []
+                frame_count = 0
 
             ret, frame = cap.read()
             if not ret:
                 continue
-
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            output = frame.copy()
 
             with blur_config_lock:
                 config = blur_config.copy()
 
             ksize = config["blur_strength"]
             sigma = config["blur_sigma"]
-            face_th = config["face_threshold"]
-            obj_th = config["object_threshold"]
 
-            # 現フレームの検出矩形を収集
-            current_rects = []
+            # N フレームに1回だけ検出を実行（重いML推論をスキップ）
+            run_detect = (frame_count % DETECT_INTERVAL == 0)
+            frame_count += 1
 
-            # 顔
-            if config["faces"]:
-                result = face_detector.detect(mp_image)
-                for det in result.detections:
-                    if det.categories[0].score >= face_th:
+            if run_detect:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+                face_th = config["face_threshold"]
+                obj_th = config["object_threshold"]
+                current_rects = []
+
+                # 顔
+                if config["faces"]:
+                    result = face_detector.detect(mp_image)
+                    for det in result.detections:
+                        if det.categories[0].score >= face_th:
+                            bb = det.bounding_box
+                            pad = 0.25
+                            px, py = int(bb.width * pad), int(bb.height * pad)
+                            current_rects.append((
+                                bb.origin_x - px, bb.origin_y - py,
+                                bb.origin_x + bb.width + px,
+                                bb.origin_y + bb.height + py,
+                            ))
+
+                # 人物・画面（共通の物体検出器）
+                if config["persons"] or config["screens"]:
+                    obj_result = object_detector.detect(mp_image)
+                    for det in obj_result.detections:
+                        cat = det.categories[0]
+                        if cat.score < obj_th:
+                            continue
                         bb = det.bounding_box
-                        pad = 0.25
-                        px, py = int(bb.width * pad), int(bb.height * pad)
-                        current_rects.append((
-                            bb.origin_x - px, bb.origin_y - py,
-                            bb.origin_x + bb.width + px,
-                            bb.origin_y + bb.height + py,
-                        ))
+                        if cat.category_name == "person" and config["persons"]:
+                            pad = 0.05
+                            px, py = int(bb.width * pad), int(bb.height * pad)
+                            current_rects.append((
+                                bb.origin_x - px, bb.origin_y - py,
+                                bb.origin_x + bb.width + px,
+                                bb.origin_y + bb.height + py,
+                            ))
+                        elif cat.category_name in ("tv", "laptop", "cell phone") and config["screens"]:
+                            pad = 0.02
+                            px, py = int(bb.width * pad), int(bb.height * pad)
+                            current_rects.append((
+                                bb.origin_x - px, bb.origin_y - py,
+                                bb.origin_x + bb.width + px,
+                                bb.origin_y + bb.height + py,
+                            ))
 
-            # 人物・画面（共通の物体検出器）
-            if config["persons"] or config["screens"]:
-                obj_result = object_detector.detect(mp_image)
-                for det in obj_result.detections:
-                    cat = det.categories[0]
-                    if cat.score < obj_th:
-                        continue
-                    bb = det.bounding_box
-                    if cat.category_name == "person" and config["persons"]:
-                        pad = 0.05
-                        px, py = int(bb.width * pad), int(bb.height * pad)
-                        current_rects.append((
-                            bb.origin_x - px, bb.origin_y - py,
-                            bb.origin_x + bb.width + px,
-                            bb.origin_y + bb.height + py,
-                        ))
-                    elif cat.category_name in ("tv", "laptop", "cell phone") and config["screens"]:
-                        pad = 0.02
-                        px, py = int(bb.width * pad), int(bb.height * pad)
-                        current_rects.append((
-                            bb.origin_x - px, bb.origin_y - py,
-                            bb.origin_x + bb.width + px,
-                            bb.origin_y + bb.height + py,
-                        ))
+                # ナンバープレート
+                if config["license_plates"]:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    plates = plate_cascade.detectMultiScale(
+                        gray, 1.1, 4, minSize=(60, 20)
+                    )
+                    for (x, y, w, h) in plates:
+                        current_rects.append((x, y, x + w, y + h))
 
-            # ナンバープレート
-            if config["license_plates"]:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                plates = plate_cascade.detectMultiScale(
-                    gray, 1.1, 4, minSize=(60, 20)
-                )
-                for (x, y, w, h) in plates:
-                    current_rects.append((x, y, x + w, y + h))
+                cached_rects = current_rects
 
-            # 履歴フレーム数を設定から反映
+                # 履歴フレーム数を設定から反映
+                history_frames = config["history_frames"]
+                if history_frames != rect_history.maxlen:
+                    rect_history = deque(rect_history, maxlen=max(1, history_frames))
+                rect_history.append(current_rects)
+
+            # ブラー適用（検出有無に関わらず毎フレーム実行）
+            output = frame
             history_frames = config["history_frames"]
-            if history_frames != rect_history.maxlen:
-                rect_history = deque(rect_history, maxlen=max(1, history_frames))
-
-            # 履歴に追加
-            rect_history.append(current_rects)
-
-            # 現フレーム＋過去フレームの全矩形をマージしてブラー
-            if history_frames > 0:
+            if history_frames > 0 and rect_history:
                 for rects in rect_history:
                     for (x1, y1, x2, y2) in rects:
                         output = blur_region(output, x1, y1, x2, y2,
                                              ksize=ksize, sigma=sigma)
             else:
-                for (x1, y1, x2, y2) in current_rects:
+                for (x1, y1, x2, y2) in cached_rects:
                     output = blur_region(output, x1, y1, x2, y2,
                                          ksize=ksize, sigma=sigma)
 
-            _, jpeg = cv2.imencode('.jpg', output, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            _, jpeg = cv2.imencode('.jpg', output, [cv2.IMWRITE_JPEG_QUALITY, 80])
             output_rgb = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
             with frame_lock:
                 latest_frame = jpeg.tobytes()
